@@ -1,0 +1,347 @@
+diff --git a/fs/LGSDEncManager.c b/fs/LGSDEncManager.c
+old mode 100755
+new mode 100644
+index 26e8029..bb024da
+--- a/fs/LGSDEncManager.c
++++ b/fs/LGSDEncManager.c
+@@ -1,111 +1,199 @@
+-//FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION
+-
+-#include <linux/kernel.h>
+-#include <linux/linkage.h>
+-#include <linux/sched.h>
+-#include <linux/unistd.h>
+-#include "LGSDEncManager.h"
+-
+-int propertyMediaCheck;				// Media Ecryption 체크 여부
+-char savedfileExtList[MAX_MEDIA_EXT_LENGTH];
+-char asecExtension[MAX_MEDIA_EXT_LENGTH] = ".ASEC";
+-
+-/*
+-*     System property의 Media Encryption 여부 저장.
+-*/
+-asmlinkage long sys_set_media_property(int value)
+-{
+-//	printk("%s :: SystemCall value: %d , propertymediacheck : %d\n", __func__,value,propertyMediaCheck);
+-	propertyMediaCheck = value;
+-	return 1;
+-}
+-
+-int getMediaProperty(void){
+-	return propertyMediaCheck;
+-}
+-
+-/*
+-* Media File 확장자 저장 System call 함수.
+-*/
+-asmlinkage long sys_set_media_ext(char *mediaExtList)
+-{
+-	memset(savedfileExtList, 0, sizeof(savedfileExtList));
+-
+-	if(mediaExtList != NULL){
+-		strncpy(savedfileExtList, mediaExtList, strlen(mediaExtList));
+-	}
+-
+-//	printk("%s :: savedfileExtList: %s\n", __func__,savedfileExtList);
+-
+-	return 1;
+-}
+-//#endif //FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION
+-
+-char *ecryptfs_Extfilename(const unsigned char *filename){
+-	char *pos = NULL;    
+-	int len , i;        
+-
+-	if(filename == NULL) {    	
+-		return pos;    
+-	}
+-
+-	// 확장자 추출 : ex> a.txt -> .txt    
+-	pos = strrchr(filename,'.');   
+-	if(pos == NULL){    	
+-		return pos;    
+-	}    	
+-
+-	// 소문자 -> 대문자	
+-	len = strlen(pos);	
+-	for(i = 0 ; i < len ; i++){		
+-		if(*(pos+i) >= 'a' && *(pos+i) <= 'z'){			
+-			*(pos+i) = *(pos+i) -32;		
+-		}	
+-	}	    
+-	return pos+1;
+-}
+-int ecryptfs_asecFileSearch(const unsigned char *filename){
+-    char *extP = NULL;
+-
+-    // extract extension in filename
+-    extP = ecryptfs_Extfilename(filename);
+-    if(extP == NULL || strlen(extP) < 2){
+-        printk(KERN_DEBUG "Extfilename is NULL\n");
+-        return 0;
+-    }
+-
+-    //check if the extension is asec
+-    if(strstr(asecExtension,extP) == NULL){
+-        return 0;
+-    }
+-    return 1;
++/* FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION */
++
++#include <linux/kernel.h>
++#include <linux/linkage.h>
++#include <linux/sched.h>
++#include <linux/unistd.h>
++#include <linux/uaccess.h>
++#include <linux/cred.h>
++#include <linux/mutex.h>
++#include <linux/uidgid.h>
++#include "LGSDEncManager.h"
++
++static DEFINE_MUTEX(media_ext_list_lock);
++
++int propertyMediaCheck;	/* whether media ecryption is checked */
++char savedfileExtList[MAX_MEDIA_EXT_LENGTH];
++const char *asecExtension = ".ASEC";
++/* global flag to check whether the media file extsion list set or not */
++bool is_savedfileExtList_set = false;
++
++/*
++*  check uid if it's not root(0) nor system(1000)
++*/
++static inline long check_uid(kuid_t uid)
++{
++	if (!uid_eq(uid, GLOBAL_ROOT_UID) &&
++			!uid_eq(uid, ANDROID_SYSTEM_SERVER_UID))
++		return -EPERM;
++	/* uid is OK */
++	return 0;
++}
++
++/*
++* Saves whether system property of media encryption is checked
++*/
++asmlinkage long sys_set_media_property(int value)
++{
++	kuid_t uid;
++
++/*	printk("%s :: SystemCall value: %d , propertymediacheck : %d\n", __func__,value,propertyMediaCheck); */
++	uid = current_uid();
++	if (check_uid(uid)) {
++		printk(KERN_ERR "%s: %s(%u) not permitted.\n",
++				__func__, current->comm, uid);
++		return -EPERM;
++	}
++
++	if ((value != 0) && (value != 1)) {
++		printk(KERN_ERR "%s: invalid property.(%d)\n", __func__, value);
++		return -EINVAL;
++	}
++	mutex_lock(&media_ext_list_lock);
++	propertyMediaCheck = value;
++	mutex_unlock(&media_ext_list_lock);
++
++	return 0;
++}
++
++int getMediaProperty(void)
++{
++	return propertyMediaCheck;
+ }
+-int ecryptfs_mediaFileSearch(const unsigned char *filename){
+-	char *extP = NULL;
+-
+-	// Filename에서 확장자 추출.
+-	extP = ecryptfs_Extfilename(filename);
+-	if(extP == NULL || strlen(extP) < 2){
+-		printk(KERN_DEBUG "%s :: Extfilename is NULL\n", __func__);
+-		return 0;
+-	}
+-
+-	printk("%s :: savedfileExtList: %s\n", __func__,savedfileExtList);
+-
+-	// MediaType에 존재 여부 확인	// 존재하면 status = 1으로 변환 : 미디어 파일이라는 의미	
+-	if(sizeof(savedfileExtList) != 0)
+-	{
+-		if(strstr(savedfileExtList,extP) == NULL){ 		  
+-			printk(KERN_DEBUG "%s :: NOT ECRYPTFS_MEDIA_EXCEPTION\n", __func__);
+-			return 0;
+-		}
+-	}
+-	else
+-	{
+-		printk(KERN_DEBUG "%s :: getMediaExtList() = NULL\n", __func__);
+-		return 0;
+-	}
+-
+-	return 1;
+-}
+-
++
++/*
++* Saves extension list of media file
++*/
++asmlinkage long sys_set_media_ext(const char __user *mediaExtList)
++{
++	long len, rc = 0;
++	kuid_t uid;
++
++	/* check uid if it's not root(0) nor system(1000) */
++	uid = current_uid();
++	if (check_uid(uid)) {
++		printk(KERN_ERR "%s: %s(%u) not permitted.\n",
++				__func__, current->comm, uid);
++		return -EPERM;
++	}
++
++	mutex_lock(&media_ext_list_lock);
++	/*
++	*   The media file extension list set on each boot-up time
++	*   and never set again while runtime. is_savedfileExtList_set
++	*   is a global flag to check whether the list has been set or not.
++	*   If it's already set, this function just return 0 for success.
++	*/
++	if (is_savedfileExtList_set) {
++		printk(KERN_INFO "%s: the file list already set.\n", __func__);
++		goto out;
++	}
++
++	/* check if mediaExtList is not userspace */
++	if (!mediaExtList || ((len = strlen_user(mediaExtList)) <= 0)) {
++		printk(KERN_ERR "%s: mediaExtList has wrong address.\n", __func__);
++		rc = -EFAULT;
++		goto out;
++	}
++
++	/* check overflow */
++	if (len >= MAX_MEDIA_EXT_LENGTH) {
++		printk(KERN_ERR "%s: mediaExtList is too large.\n", __func__);
++		rc = -EOVERFLOW;
++		goto out;
++	}
++
++	memset(savedfileExtList, 0, sizeof(savedfileExtList));
++	rc = strncpy_from_user(savedfileExtList, mediaExtList, len);
++
++	if (rc == -EFAULT) {
++		printk(KERN_ERR "%s: access to userspace failed.\n", __func__);
++		goto out;
++	}
++
++	is_savedfileExtList_set = true;
++	/* set return value 0 for success */
++	rc = 0;
++
++	/* for debuging */
++	/* printk("%s :: savedfileExtList(%d bytes): %s\n",
++			__func__, strlen(savedfileExtList), savedfileExtList); */
++
++out:
++	mutex_unlock(&media_ext_list_lock);
++	return rc;
++}
++/* #endif //FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION */
++
++char *ecryptfs_Extfilename(const unsigned char *filename)
++{
++	char *pos = NULL;
++	int len , i;
++
++	if (filename == NULL) {
++		return pos;
++	}
++
++	/* extract extension of file : ex> a.txt -> .txt */
++	pos = strrchr(filename, '.');
++	if (pos == NULL) {
++		return pos;
++	}
++
++	/* lowercase -> uppercase */
++	len = strlen(pos);
++	for (i = 0 ; i < len ; i++) {
++		if (*(pos+i) >= 'a' && *(pos+i) <= 'z') {
++			*(pos+i) = *(pos+i) - 32;
++		}
++	}
++	return pos+1;
++}
++
++
++int ecryptfs_asecFileSearch(const unsigned char *filename)
++{
++	char *extP = NULL;
++
++	/* extract extension in filename */
++	extP = ecryptfs_Extfilename(filename);
++	if (extP == NULL || strlen(extP) < 2) {
++		printk(KERN_DEBUG "Extfilename is NULL\n");
++		return 0;
++	}
++
++	/* check if the extension is asec */
++	if (strstr(asecExtension, extP) == NULL) {
++		return 0;
++	}
++	return 1;
++}
++
++int ecryptfs_mediaFileSearch(const unsigned char *filename)
++{
++	char *extP = NULL;
++
++	/* extract extension in filename */
++	extP = ecryptfs_Extfilename(filename);
++	if (extP == NULL || strlen(extP) < 2) {
++		printk(KERN_DEBUG "%s :: Extfilename is NULL\n", __func__);
++		return 0;
++	}
++
++	printk("%s :: savedfileExtList: %s\n", __func__, savedfileExtList);
++
++	/* check if the extension exists in MediaType
++	*  if exists status = 1 meaning the file is media file */
++	if (sizeof(savedfileExtList) != 0) {
++		if (strstr(savedfileExtList, extP) == NULL) {
++			printk(KERN_DEBUG "%s :: NOT ECRYPTFS_MEDIA_EXCEPTION\n", __func__);
++			return 0;
++		}
++	} else {
++		printk(KERN_DEBUG "%s :: getMediaExtList() = NULL\n", __func__);
++		return 0;
++	}
++
++	return 1;
++}
++
+diff --git a/fs/LGSDEncManager.h b/fs/LGSDEncManager.h
+index c3b2423..51200bf 100644
+--- a/fs/LGSDEncManager.h
++++ b/fs/LGSDEncManager.h
+@@ -12,11 +12,11 @@
+ #include <linux/ecryptfs.h>
+ 
+ #define FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION
+-#define MAX_MEDIA_EXT_LENGTH 330
++#define MAX_MEDIA_EXT_LENGTH 512
+ #define MAX_FILE_NAME_LENGTH 255
++#define ANDROID_SYSTEM_SERVER_UID KUIDT_INIT(1000)
+ 
+ extern int getMediaProperty(void);
+ extern int ecryptfs_mediaFileSearch(const unsigned char *filename);
+ extern char *ecryptfs_Extfilename(const unsigned char *filename);
+ extern int ecryptfs_asecFileSearch(const unsigned char *filename);
+-
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 4e98d71..98d991f 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -848,4 +848,8 @@ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+ asmlinkage long sys_seccomp(unsigned int op, unsigned int flags,
+ 			    const char __user *uargs);
++/*FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION[S] */
++asmlinkage long sys_set_media_property(int value);
++asmlinkage long sys_set_media_ext(const char __user *mediaExtList);
++/*FEATURE_SDCARD_MEDIAEXN_SYSTEMCALL_ENCRYPTION[E] */
+ #endif
